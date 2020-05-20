@@ -1,0 +1,464 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+```{r echo=FALSE}
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+library(openxlsx)
+```
+
+
+```{r}
+
+read.line.data=function( file, re.admission.min.days = 1, ... ) {
+  hosp=read.xlsx( file)
+  
+  #fix colnames, because they aren't the same in the tables.
+  cn = colnames(hosp)
+  pui.col      = grep("(ID|PUI|Deidentified.Patient)$",cn)
+  adm.date.col = grep("date.*admission",ignore.case = T,cn)
+  dis.date.col = grep("date.*discharge",ignore.case = T,cn)
+  colnames(hosp)[pui.col]="PUI"
+  adm.name = "Date.of.Admission"
+  dis.name = "Date.of.Discharge"
+  colnames(hosp)[adm.date.col] = adm.name
+  colnames(hosp)[dis.date.col] = dis.name
+  
+  hosp[,adm.date.col] %<>% convertToDateTime
+  hosp[,dis.date.col] %<>% convertToDateTime
+  
+  # Parse dates
+  myparser = function(str) {
+    parse_date_time( str, orders=c("ymd","ymd_HMS","ymd_HM","mdy_HM"))
+  #  i = grepl(":",str )
+  #  out=rep(ymd(NA,tz="MsT"), length(str)) # we want NA that are PosixCt.
+  #  out[i] =ymd_hms(str[ i])
+  #  out[!i]=ymd    (str[!i])
+
+  #  naind = which(is.na(out))
+  #  out[naind] = mdy_hm(str[naind])
+  #  out
+  }
+  
+  hosp$admit_timestamp = hosp[,adm.name] %>%
+    as.character() %>%
+    myparser
+  
+  hosp$discharge_timestamp = hosp[,dis.name] %>%
+    as.character() %>%
+    myparser
+  
+  
+  # Split ages into groups
+  hosp$Age = as.numeric(hosp$Age)
+  hosp$Age.group = cut(as.numeric(hosp$Age),br=c(0,4,17,49,64,120))
+  
+  
+  if( hosp %>% colnames %>% grep(pattern="occupation",ignore.case = T) %>% length > 0) {
+    hosp$const=grepl("const",hosp$Occupation,ignore.case = T)
+    hosp$LTC=grepl("resi",hosp$Occupation,ignore.case = T)
+    hosp$no.Occupation = is.na(hosp$Occupation) | grepl("not",hosp$Occupation,ignore.case = T) | hosp$Occupation=="na" | 
+      grepl("NA",hosp$Occupation,ignore.case = F)  |grepl("unk",hosp$Occupation,ignore.case = T)
+  }
+  hosp$admit.day=as.POSIXct(floor(as.double(hosp$admit_timestamp)/(24*3600))*24*3600,tz = "UTC",origin = "1970-01-01")
+  hosp$dis.day=as.POSIXct(floor(as.double(hosp$discharge_timestamp)/(24*3600))*24*3600,tz = "UTC",origin = "1970-01-01")
+  hosp$death = grepl("expir",hosp$Discharge.Status, ignore.case = T) | grepl("died",hosp$Discharge.Status, ignore.case = T)
+  hosp$death[is.na(hosp$Discharge.Status)]=NA
+  
+  # sort hosp table by admt timestamp
+  o=order(hosp$admit_timestamp)
+  hosp=hosp[o,]
+  
+  # fix multiple admissions
+  hosp$PUIA = paste(hosp$PUI, hosp$Age)    # because sometimes individuals share PUIA, we make it a bit more unique
+  # Find PUI that have more than one line
+  tmult = table( hosp$PUIA)
+  tmult %<>% {(.)[. > 1]} %>% names
+  
+  # split hosp table into two parts, single and multiple admits
+  i = hosp$PUIA %in% tmult
+  hosp.m = hosp[i,]
+  hosp.s = hosp[!i,]
+  
+  # Following loop joins lines where admit occurs less than a day from previous discharge
+  x = lapply( tmult, function(i) {
+    #browser()
+    # find all lines that relate to this individual
+    a = hosp.m[hosp.m$PUIA == i,]
+    # convert matrix into list of matrices of single lines
+    la = lapply(1:dim(a)[1], function(j) a[j,,drop=F])
+    
+    # join adjacent matrices to single matrix if admit - discharge is less than 1 day
+    j=1
+    while( j<length(la)) { # there is still another matrix beyond j in the list
+      ad = (la[[j+1]] %>% head(n=1))$admit_timestamp     # next admit
+      di = (la[[j]] %>% tail(n=1))$discharge_timestamp  # current discharge
+      if( is.na(ad) | is.na(di)) {
+      }
+      if(  !is.na(ad) & !is.na(di) & ad-di  < ddays( re.admission.min.days ) )  {  # difference is less than re.admission.min.days
+        la[[j]] = rbind( la[[j]],la[[j+1]]) # join next mat tu current 
+        la = la[-(j+1)]                     # and drop it
+                                            # j doesn't need to be changed, because we have 
+                                            # to compare to next next mat
+      } else { # if current mat can't be joined to next, increase j.
+        j=j+1 
+      } 
+    }
+    # Now we have a list of matrices, each of which needs to be converted to a single line
+    #print("here")
+    do.call( rbind, lapply( la, function(a) {
+      if( dim(a)[1]>1) {
+      # convert to single line, find min admit, max discharge:
+      e = which.max( a$admit_timestamp)  
+      s = which.min( a$admit_timestamp)
+      
+      b = a[s,] # we build the joined line into b. Copy data from first admit line
+      # from line of last discharge take info about discharge:
+      cols.from.last = c(dis.name,"Discharge.Status","discharge_timestamp","dis.day","death")
+      b[cols.from.last] = a[e,cols.from.last]
+      
+      # some info, we can just gather from all lines in a into single entry in b:
+      if( "Comments" %in% colnames(hosp) ) {
+      b["Comments"] = paste(c(a[,"Comments"]%>%{.[!is.na(.)]},a[,"Discharge.Status"]%>%{.[!is.na(.)]}),sep=";",collapse = ";")
+      if( b["Comments"] == "" ) b["Comments"] = NA 
+      } else {
+      b["Discharge.Status"] = paste(c(a[,"Discharge.Status"]%>%{.[!is.na(.)]}),sep=";",collapse = ";")
+      if( b["Discharge.Status"] == "" ) b["Discharge.Status"] = NA 
+      }
+  
+      # Boolean entries: if patient was in ICU in any line, it means patient was in ICU. Same for Ventilator
+      b["ICU?"] = ifelse( sum( a[,"ICU?"]=="Yes",na.rm=T) > 0, "Yes", "No")
+      b["Ventilator?"] = ifelse( sum( a[,"Ventilator?"]=="Yes",na.rm=T) > 0, "Yes", "No")
+      b
+      } else {
+        a
+      }
+    }) )
+  })
+  
+  # Finally, join matrix with individuals who have single entry with this new matrix
+  hosp.o = hosp
+  hosp = rbind( hosp.s, do.call(rbind,x))
+  
+  # Now is the time to calculate length of stay, after we joined lines.
+  hosp = mutate(hosp, time_in_hosp = as.duration(discharge_timestamp - admit_timestamp)/ddays(1))
+  hosp
+}
+
+```
+
+
+```{r}
+# Build admit/discharge/death table from hosp table
+
+generate.case.table=function( hosp) {
+  adm.tab= hosp %$% table( admit.day, Age.group) %>% as.data.frame.matrix %>% as.matrix
+  colnames( adm.tab ) %<>% paste("adm", . )
+  
+  dis.tab= hosp %$%   table( dis.day[ !death ], Age.group[ !death]) %>% as.data.frame.matrix %>% as.matrix
+  colnames( dis.tab ) %<>% paste("dis", . )
+  
+  death.tab= hosp %$% table( dis.day[death],Age.group[death]) %>% as.data.frame.matrix %>% as.matrix
+  colnames( death.tab ) %<>% paste("death", . )
+  
+  #Join three tables into single table
+  # first make a table for all dates, fill with 0
+  r=range(c(hosp$dis.day,hosp$admit.day),na.rm = T)
+  dates = seq(from=r[1],to=r[2],by= ddays(1))
+  A = matrix(0,length(dates), dim(adm.tab)[2]*3 )
+  row.names(A) = as.character(dates)
+  colnames(A) = c(colnames( adm.tab), colnames(dis.tab), colnames(death.tab) )
+  
+  # fill table with data from tables (strange that you need <<- here.)
+  adm.tab %>% { A[ rownames(.), colnames(.)] <<- . }
+  dis.tab %>% { A[ rownames(.), colnames(.)] <<- . }
+  death.tab %>% { A[ rownames(.), colnames(.)] <<- . }
+  
+  A
+}
+```
+
+
+```{r}
+#hosp=read.line.data("C:/Users/Michael Lachmann/Documents/CV19/LaurenMeyersHospitalizationList_Final5.6.20.xlsx")
+#hosp=read.line.data("C:/Users/Michael Lachmann/Documents/CV19/LaurenMeyers_HospitalizationList.xlsx")
+#hosp=read.xlsx("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization Data_Meyers_5.11.2020.xlsx",detectDates = T)
+#hosp=read.xlsx("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization Data_Meyers_5.12.2020.xlsx",detectDates = T)
+#hosp=read.xlsx("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization Data_Meyers_5.13.2020_variables.xlsx",detectDates = T)
+#hosp=read.xlsx("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization 
+
+#hosp = read.line.data("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization Data_Meyers_5.14.2020.xlsx", re.admission.min.days = 1, sheet=2 )
+hosp = read.line.data("C:/Users/Michael Lachmann/Documents/CV19/Hospitalization Data_Meyers_5.19.2020.xlsx", re.admission.min.days = 1 )
+
+
+A = generate.case.table( hosp)
+
+
+write.csv(file="dates_by_age_by_events.csv",A)
+
+```
+
+
+
+```{r}
+pol=function(x=c(),y1,y2=c(),min.y=0,...) {
+  if(length(x)==0) { x=seq_along(y1) }
+  if( length(y2)==0) {
+    polygon( c(head(x,1), x, tail(x,1), head(x,1) ), c(min.y, y1, min.y, min.y), ...   )
+  } else {
+    polygon( c(head(x,1), x, rev(x) ), c(min.y, y1, rev(y2)), ...   )
+  }
+}
+
+```
+
+
+```{r eval=F}
+plot((A2[,1:5]-A2[,6:10]-A2[,11:15]) %>% rowSums %>% cumsum )
+plot((A[,1:5]-A[,6:10]-A[,11:15]) %>% rowSums %>% cumsum )
+
+```
+
+
+```{r eval=F}
+B=apply(A,2,cumsum)
+
+adm = "adm" %>% {grep(.,colnames(B))} %>% {B[, .] / (B[, .] %>% rowSums)} %>% as.matrix
+dis = "dis" %>% {grep(.,colnames(B))} %>% {B[, .] / (B[, .] %>% rowSums)}
+dth = "death" %>% {grep(.,colnames(B))} %>% {B[, .] / (B[, .] %>% rowSums)}
+
+
+y = apply( adm, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dis, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dth, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+
+B7 = B %>% { tail( . ,-7) - head( ., -7) } / 7
+#B7 = A
+
+adm7 = "adm" %>% {grep(.,colnames(B7))} %>% {B7[, .] / (B7[, .] %>% rowSums)} %>% as.matrix
+dis7 = "dis" %>% {grep(.,colnames(B7))} %>% {B7[, .] / (B7[, .] %>% rowSums)}
+dth7 = "death" %>% {grep(.,colnames(B7))} %>% {B7[, .] / (B7[, .] %>% rowSums)}
+
+
+
+y = apply( adm7, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dis7, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dth7, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,1),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+
+
+
+adm7b = "adm" %>% {grep(.,colnames(B7))} %>% {B7[, .] } %>% as.matrix
+dis7b = "dis" %>% {grep(.,colnames(B7))} %>% {B7[, .] }%>% as.matrix
+dth7b = "death" %>% {grep(.,colnames(B7))} %>% {B7[, .] } %>% as.matrix
+
+
+
+y = apply( adm7b, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,max(y)),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dis7b, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,max(y)),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+y = apply( dth7b, 1, . %>% cumsum) %>% t
+x = y %>% rownames() %>% ymd()
+plot(x,x,ylim=c(0,max(y)),type="n")
+pol( x, y[,1],          col=rainbow(5)[1])
+for( i in 2:5)
+pol( x, y[,i], y[,i-1],col=rainbow(5)[i])
+
+
+plot(x,adm7b[,3],type="l",col=rainbow(5)[3])
+lines(x, adm7b[,4],col=rainbow(5)[4])
+lines(x, adm7b[,5],col=rainbow(5)[5])
+
+plot(A %>% rownames %>% ymd,cumsum(A[,5]-A[,10]),type="l",xlab="date",ylab="hosp")
+lines(A %>% rownames %>% ymd,cumsum(A[,3]-A[,8]),type="l",xlab="date",ylab="hosp",col=2)
+lines(A %>% rownames %>% ymd,cumsum(A[,4]-A[,9]),type="l",xlab="date",ylab="hosp",col=3)
+lines(A %>% rownames %>% ymd,cumsum(A[,5]-A[,10]),type="l",xlab="date",ylab="hosp")
+plot(A %>% rownames %>% ymd,cumsum(A[,10]),type="l",xlab="date",ylab="adm")
+plot(A %>% rownames %>% ymd,(A[,3]),type="l",xlab="date",ylab="adm")
+plot(A %>% rownames %>% ymd,cumsum(A[,8]),type="l",xlab="date",ylab="dis")
+
+
+
+plot(B %>% rownames %>% ymd,(B[,5]-B[,10]),type="l",xlab="date",ylab="hosp")
+lines(B %>% rownames %>% ymd,(B[,3]-B[,8]),type="l",xlab="date",ylab="hosp",col=2)
+lines(A %>% rownames %>% ymd,(B[,4]-B[,9]),type="l",xlab="date",ylab="hosp",col=3)
+lines(A %>% rownames %>% ymd,cumsum(A[,5]-A[,10]),type="l",xlab="date",ylab="hosp")
+
+
+plot(B %>% rownames %>% ymd,(B[,5]),type="l",xlab="date",ylab="adm")
+lines(B %>% rownames %>% ymd,(B[,10]),type="l",xlab="date",ylab="adm")
+
+plot(A %>% rownames %>% ymd,(A[,3]),type="l",xlab="date",ylab="adm")
+plot(A %>% rownames %>% ymd,cumsum(A[,8]),type="l",xlab="date",ylab="dis")
+
+```
+
+
+```{r eval=F}
+h=hosp[hosp$Age.group=="(64,120]",c("admit.day","dis.day","death","ICU?")]
+h$admit.day %<>% ymd
+h$dis.day %<>% ymd
+h$dis.day[is.na(h$dis.day)]=max(h$dis.day,na.rm = T)
+h=h[!is.na(h$admit.day),]
+h=h[order(h$admit.day),]
+plot(range(c(h$admit.day,h$dis.day)),c(0,dim(h)[1]),type="n")
+for(i in 1:dim(h)[1]) { 
+  lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=as.integer(h$`ICU?`[i]=="Yes")+3)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=22)
+    else points(h$dis.day[i],i,col=1,pch=20)
+  }
+  }
+
+```
+
+
+
+```{r eval=F}
+h=hosp[hosp$Age.group=="(17,49]",c("admit.day","dis.day","death","ICU?")]
+h$admit.day %<>% ymd
+h$dis.day %<>% ymd
+h$dis.day[is.na(h$dis.day)]=max(h$dis.day,na.rm = T)
+h=h[!is.na(h$admit.day),]
+h=h[order(h$admit.day),]
+plot(range(c(h$admit.day,h$dis.day)),c(0,dim(h)[1]),type="n")
+for(i in 1:dim(h)[1]) { lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=1 ) #as.integer(h$`ICU?`[i]=="Yes")+1)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=20)
+    else points(h$dis.day[i],i,col=3,pch=20)
+  }
+  }
+
+```
+
+
+
+
+```{r eval=F}
+h=hosp[hosp$Age.group=="(64,120]",c("admit.day","dis.day","death","ICU?","LTC","no.Occupation")]
+h$admit.day %<>% ymd
+h$dis.day %<>% ymd
+h$dis.day[is.na(h$dis.day)]=max(h$dis.day,na.rm = T)
+h=h[!is.na(h$admit.day),]
+h=h[order(h$admit.day),]
+plot(range(c(h$admit.day,h$dis.day)),c(0,dim(h)[1]),type="n")
+for(i in which(!h$no.Occupation) ) { lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=1 ) #as.integer(h$`ICU?`[i]=="Yes")+1)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=20)
+    else points(h$dis.day[i],i,col=3,pch=20)
+  }
+  }
+
+for(i in which(h$LTC) ){ lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=3 ) #as.integer(h$`ICU?`[i]=="Yes")+1)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=20)
+    else points(h$dis.day[i],i,col=3,pch=20)
+  }
+  }
+
+
+```
+
+
+
+```{r eval=F}
+h=hosp[hosp$Age.group=="(17,49]",c("admit.day","dis.day","death","ICU?","LTC","const","no.Occupation")]
+h$admit.day %<>% ymd
+h$dis.day %<>% ymd
+h$dis.day[is.na(h$dis.day)]=max(h$dis.day,na.rm = T)
+h=h[!is.na(h$admit.day),]
+h=h[order(h$admit.day),]
+plot(range(c(h$admit.day,h$dis.day)),c(0,dim(h)[1]),type="n")
+for(i in which(!h$no.Occupation) ) { lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=1 ) #as.integer(h$`ICU?`[i]=="Yes")+1)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=20)
+    else points(h$dis.day[i],i,col=3,pch=20)
+  }
+  }
+
+for(i in which(h$const) ){ lines( c(h$admit.day[i],h$dis.day[i]),c(i,i),lwd=2,col=3 ) #as.integer(h$`ICU?`[i]=="Yes")+1)
+  if( !is.na(h$death[i]) ) {
+    if( h$death[i]) points(h$dis.day[i],i,col=2,pch=20)
+    else points(h$dis.day[i],i,col=3,pch=20)
+  }
+  }
+
+
+```
+
+
+
+
+```{r eval=F}
+ xA = A %>% rownames %>% ymd()
+ xa = a[,1] %>% dmy()
+ layout(cbind(1,2))
+ plot(xA, A[,1:5] %>% rowSums,type="b" )
+ points(xa, a[,2], col=2)
+ plot(xA, (A[,6:10]+A[,11:15] )%>% rowSums,type="b" )
+ points(xa, a[,3], col=2)
+
+plot( xA, (A[,1:5]-A[,6:10]-A[,11:15]) %>% rowSums %>% cumsum)
+points(xa, a[,4],col=2)
+points(xa, (a[,2]-a[,3]) %>% cumsum,col=3)
+ 
+```
+
+
+
+```{r}
+A[52:56,6:10] %>% rowSums
+A[52:56,11:15] %>% rowSums
+a[52:58,]
+```
+
